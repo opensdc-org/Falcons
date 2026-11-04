@@ -214,12 +214,6 @@ void partition_checks(int threads) {
 
 template <class T, unsigned N>
 void release_compression(Decomp<T, N> &d) {
-    ::operator delete[](d.total_quant_inds, std::align_val_t(64));
-    delete[] d.local_quant_inds;
-    delete[] d.local_quant_index;
-    ::operator delete[](d.quantizer.unpred_vec, std::align_val_t(64));
-    delete[] d.quantizer.local_unpred;
-    delete[] d.quantizer.local_unpred_idx;
     d.release_temporary_storage();
 }
 

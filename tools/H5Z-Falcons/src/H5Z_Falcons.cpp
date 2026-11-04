@@ -1,5 +1,6 @@
 #include "H5Z_Falcons.hpp"
 
+#include <atomic>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
@@ -16,6 +17,14 @@
 
 
 hid_t H5Z_Falcons_ERRCLASS = -1;
+
+static std::atomic<int> falcons_decode_threads{0};
+
+extern "C" HDF5Falcons_EXPORT int H5Z_Falcons_set_decode_threads(int num_threads) {
+    if (num_threads < 0) return -1;
+    falcons_decode_threads.store(num_threads, std::memory_order_relaxed);
+    return 0;
+}
 
 // filter definition
 const H5Z_class2_t H5Z_Falcons[1] = {{
@@ -139,9 +148,6 @@ private:
 #endif
 
 static herr_t H5Z_falcons_set_local(hid_t dcpl_id, hid_t type_id, hid_t chunk_space_id) {
-    printf("start H5Z_falcons_set_local\n");
-
-    // printf("start in H5Z_falcons_set_local, dcpl_id = %d\n", dcpl_id);
     static char const* _funcname_ = "H5Z_falcons_set_local";
 
     // herr_t ret = H5Zregister(H5Z_Falcons);
@@ -261,7 +267,6 @@ size_t process_data(Falcons::Config& conf, void** buf, size_t* buf_size, size_t 
  */
 static size_t H5Z_filter_falcons(unsigned int flags, size_t cd_nelmts, const unsigned int cd_values[], size_t nbytes,
                              size_t* buf_size, void** buf) {
-    printf("start H5Z_filter_falcons\n");
 
     if (cd_nelmts == 0) // this is special data such as string, which should not be treated as values.
         return nbytes;
@@ -272,13 +277,15 @@ static size_t H5Z_filter_falcons(unsigned int flags, size_t cd_nelmts, const uns
         conf.load(buffer, cd_nelmts * sizeof(unsigned int));
         if (conf.num < 20) return nbytes;
 
+        const bool is_decompress = (flags & H5Z_FLAG_REVERSE) != 0;
+        if (is_decompress) conf.ompDecodeThreads = falcons_decode_threads.load(std::memory_order_relaxed);
+
         const auto num_threads = get_num_threads(cd_nelmts, cd_values);
 #ifdef _OPENMP
         ScopedOmpSettings omp_settings(num_threads);
 #else
         (void)num_threads;
 #endif
-        bool is_decompress = flags & H5Z_FLAG_REVERSE;
         switch (conf.dataType) {
         case Falcons_FLOAT:
             return process_data<float>(conf, buf, buf_size, nbytes, is_decompress);

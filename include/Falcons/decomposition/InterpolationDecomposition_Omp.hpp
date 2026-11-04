@@ -51,6 +51,12 @@
 namespace Falcons {
 template <class T, uint N, class QuantizerOMP>
 class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_OMP<T, int16_t, N> {
+    struct AlignedQuantDeleter {
+        void operator()(int16_t *ptr) const noexcept {
+            ::operator delete[](ptr, std::align_val_t(64));
+        }
+    };
+
     struct ScopedInterpolationBuffers {
         T *&a, *&b, *&c, *&d;
         std::unique_ptr<T[]> owned_a, owned_b, owned_c, owned_d;
@@ -122,11 +128,15 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         init();
 
         ScopedOmpSettings omp_settings;
-        if (nThreads == 0 || nThreads > static_cast<size_t>(std::numeric_limits<int>::max()) ||
-            actual_team_size(static_cast<int>(nThreads)) != static_cast<int>(nThreads)) {
+        if (nThreads == 0 || nThreads > static_cast<size_t>(std::numeric_limits<int>::max())) {
             throw std::runtime_error("Cannot reproduce the compression OpenMP team");
         }
-        omp_set_num_threads(static_cast<int>(nThreads));
+        reduced_omp_team = N == 2 && conf.ompDecodeThreads > 0 &&
+                           static_cast<size_t>(conf.ompDecodeThreads) < nThreads;
+        if (!reduced_omp_team && actual_team_size(static_cast<int>(nThreads)) != static_cast<int>(nThreads)) {
+            throw std::runtime_error("Cannot reproduce the compression OpenMP team");
+        }
+        omp_set_num_threads(reduced_omp_team ? conf.ompDecodeThreads : static_cast<int>(nThreads));
 
         ScopedInterpolationBuffers interp_buffers(interp_buffer_1, interp_buffer_2, interp_buffer_3, interp_buffer_4);
         if constexpr (N != 1) {
@@ -248,6 +258,8 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
 
     std::tuple<int16_t**, CacheLineInt*> compress(const Config &conf, T *data) override {
         release_temporary_storage();
+        CleanupOnFailure cleanup{*this};
+        reduced_omp_team = false;
         if (!data || conf.dims.size() != N) {
             throw std::invalid_argument("Invalid interpolation input dimensions or buffer");
         }
@@ -295,8 +307,10 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         timer.stop("buffer init" );
         timer.start();
 #endif
-        int16_t** local_quant_inds_vec = new int16_t*[nThreads];
-        CacheLineInt* local_quant_index_vec = new CacheLineInt[nThreads];
+        local_quant_inds_owner.reset(new int16_t*[nThreads]);
+        local_quant_index_owner.reset(new CacheLineInt[nThreads]);
+        int16_t** local_quant_inds_vec = local_quant_inds_owner.get();
+        CacheLineInt* local_quant_index_vec = local_quant_index_owner.get();
 
         if constexpr (N == 1) {
             if constexpr (std::is_integral_v<T>) {
@@ -336,8 +350,9 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         size_t padded_each_num = buffer_bounds::mul(
             buffer_bounds::add(buffer_bounds::add(static_cast<size_t>(each_num), elems_per_cacheline - 1) /
                                elems_per_cacheline, 1), elems_per_cacheline);
-        total_quant_inds = new (std::align_val_t(alignment))
-            int16_t[buffer_bounds::mul(nThreads, padded_each_num)];
+        total_quant_inds_owner.reset(new (std::align_val_t(alignment))
+            int16_t[buffer_bounds::mul(nThreads, padded_each_num)]);
+        total_quant_inds = total_quant_inds_owner.get();
 #if defined(__linux__)
         // THP on this array pays off only when each thread's quant slice is large enough that
         // TLB relief outweighs the huge-page first-touch/setup cost. Measured: the hint wins by
@@ -458,6 +473,7 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
 #ifdef Falcons_PRINT_TIMINGS
         timer.stop("other: " );
 #endif
+        cleanup.committed = true;
         return {local_quant_inds_vec, local_quant_index_vec};
     }
 
@@ -536,6 +552,8 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
 
    private:
     void release_quant_storage() noexcept {
+        total_quant_inds_owner.reset();
+        local_quant_inds_owner.reset();
         local_quant_index_owner.reset();
         total_quant_inds = nullptr;
         local_quant_inds = nullptr;
@@ -543,6 +561,7 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
     }
 
     bool coarse_serial_ready = false;
+    bool reduced_omp_team = false;
 
 #if defined(__AVX2__) || defined(__ARM_FEATURE_SVE2)
     size_t simd_1d_stream_capacity() const {
@@ -744,6 +763,38 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         }
     }
 
+    template <class Func>
+    void parallel_for_logical_threads(size_t items, Func &&func) {
+        // Match the contiguous static partition used by GCC libgomp at compression.
+        const size_t base = items / nThreads;
+        const size_t rem = items % nThreads;
+        #pragma omp parallel for schedule(static, 1)
+        for (size_t tid = 0; tid < nThreads; ++tid) {
+            const size_t first = tid * base + std::min(tid, rem);
+            const size_t count = base + (tid < rem);
+            for (size_t i = first; i < first + count; ++i) {
+                func(i, static_cast<int>(tid));
+            }
+        }
+    }
+
+    template <COMPMODE CompMode, class Func>
+    void parallel_for_2d_y_partitions(Func &&func) {
+        if constexpr (CompMode == COMPMODE::DECOMP) {
+            if (reduced_omp_team) {
+                #pragma omp parallel for schedule(static, 1)
+                for (size_t tid = 0; tid < nThreads; ++tid) {
+                    func(tid);
+                }
+                return;
+            }
+        }
+        #pragma omp parallel
+        {
+            func(static_cast<size_t>(omp_get_thread_num()));
+        }
+    }
+
     template <COMPMODE CompMode, bool SkipOverwrite>
     ALWAYS_INLINE void quantize_point(size_t idx, T &d, T pred, int tid) {
         (void)idx;
@@ -859,6 +910,18 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
     void foreach_stream_static(T *data, size_t offset, const std::array<size_t, N> &begins,
                                const std::array<size_t, N> &ends, const std::array<size_t, N> &strides,
                                const std::array<size_t, N> &dim_offsets, Func &&func) {
+        if constexpr (N == 2) {
+            if (reduced_omp_team) {
+                const size_t rows = coarse_trip_count(begins[0], ends[0], strides[0]);
+                parallel_for_logical_threads(rows, [&](size_t row, int tid) {
+                    const size_t i = begins[0] + row * strides[0];
+                    for (size_t j = begins[1]; j < ends[1]; j += strides[1]) {
+                        func(data + offset + i * dim_offsets[0] + j * dim_offsets[1], tid);
+                    }
+                });
+                return;
+            }
+        }
         if constexpr (N == 2 || N == 3) {
             #pragma omp parallel for schedule(static)
             for (size_t i = begins[0]; i < ends[0]; i += strides[0]) {
@@ -935,11 +998,18 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
         // std::cout << "Successfully run to this inte0." <<std::endl;
         if (interp_func == "linear" || n < 5) {
             // if (pb == PB_predict_overwrite) {
-            #pragma omp parallel for
-            for (size_t i = 1; i < n - 1; i += 2) {
-                auto tid = omp_get_thread_num();
-                T *d = data + begin + i * stride;
-                quantize_func(d - data, *d, interp_linear(*(d - stride), *(d + stride)), tid);
+            if (reduced_omp_team) {
+                parallel_for_logical_threads(coarse_trip_count(1, n - 1, 2), [&](size_t index, int tid) {
+                    T *d = data + begin + (1 + index * 2) * stride;
+                    quantize_func(d - data, *d, interp_linear(*(d - stride), *(d + stride)), tid);
+                });
+            } else {
+                #pragma omp parallel for
+                for (size_t i = 1; i < n - 1; i += 2) {
+                    auto tid = omp_get_thread_num();
+                    T *d = data + begin + i * stride;
+                    quantize_func(d - data, *d, interp_linear(*(d - stride), *(d + stride)), tid);
+                }
             }
             if (n % 2 == 0) {
                 T *d = data + begin + (n - 1) * stride;
@@ -952,12 +1022,20 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
             // }
         } else {
             size_t i;
-            #pragma omp parallel for
-            for (i = 3; i < n - 3; i += 2) {
-                auto tid = omp_get_thread_num();
-                T *d = data + begin + i * stride;
-                quantize_func(d - data, *d,
-                              interp_cubic(*(d - stride3x), *(d - stride), *(d + stride), *(d + stride3x)), tid);
+            if (reduced_omp_team) {
+                parallel_for_logical_threads(coarse_trip_count(3, n - 3, 2), [&](size_t index, int tid) {
+                    T *d = data + begin + (3 + index * 2) * stride;
+                    quantize_func(d - data, *d,
+                                  interp_cubic(*(d - stride3x), *(d - stride), *(d + stride), *(d + stride3x)), tid);
+                });
+            } else {
+                #pragma omp parallel for
+                for (i = 3; i < n - 3; i += 2) {
+                    auto tid = omp_get_thread_num();
+                    T *d = data + begin + i * stride;
+                    quantize_func(d - data, *d,
+                                  interp_cubic(*(d - stride3x), *(d - stride), *(d + stride), *(d + stride3x)), tid);
+                }
             }
             T *d = data + begin + stride;
             quantize_func(d - data, *d, interp_quad_1(*(d - stride), *(d + stride), *(d + stride3x)), 0);
@@ -2301,14 +2379,14 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
             strides[direction] = 2;
             size_t vector_len = ends[1] > begins[1] ? (ends[1]-begins[1]-1)/strides[1] + 1 : 0;
             size_t nthreads = omp_get_max_threads();
+            if constexpr (CompMode == COMPMODE::DECOMP) {
+                if (reduced_omp_team) nthreads = nThreads;
+            }
             size_t total_iters = (ends[0] - begins[0] + 1) >> 1;
 
             size_t base = total_iters / nthreads;
             size_t rem  = total_iters % nthreads;
-            #pragma omp parallel //num_threads(omp_get_max_threads())
-            {
-                size_t tid = omp_get_thread_num();
-
+            parallel_for_2d_y_partitions<CompMode>([&](size_t tid) {
                 size_t my_iters = base + (tid < rem);
                 size_t iter_start = tid < rem
                     ? tid * (base + 1)
@@ -2347,7 +2425,7 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
                         data + cur_ij_offset, strides[1], cur_ij_offset, tid, quantize_func);
                     }
                 }
-            }
+            });
             // for (size_t j = begins[1]; j < ends[1]; j += strides[1]) {
             // #pragma omp parallel for
             // for(size_t i = begins[0]; i < ends[0]; i += strides[0]){
@@ -2459,13 +2537,18 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
                     data + cur_ij_offset, strides[1], cur_ij_offset, 0, quantize_func);
             }
             size_t nthreads = omp_get_max_threads();
+            if constexpr (CompMode == COMPMODE::DECOMP) {
+                if (reduced_omp_team) nthreads = nThreads;
+            }
             size_t total_iters = (ends[0] - begins[0] + 1) >> 1;
+            if constexpr (CompMode == COMPMODE::DECOMP) {
+                // Short cubic lines have no interior rows.
+                if (reduced_omp_team && ends[0] <= begins[0]) total_iters = 0;
+            }
 
             size_t base = total_iters / nthreads;
             size_t rem  = total_iters % nthreads;
-            #pragma omp parallel //num_threads(omp_get_max_threads())
-            {
-                size_t tid = omp_get_thread_num();
+            parallel_for_2d_y_partitions<CompMode>([&](size_t tid) {
                 size_t my_iters = base + (tid < rem);
                 size_t iter_start = tid < rem
                     ? tid * (base + 1)
@@ -2516,7 +2599,7 @@ class InterpolationDecomposition_OMP : public concepts::DecompositionInterface_O
                         data + cur_ij_offset, strides[1], cur_ij_offset, tid, quantize_func);
                     }
                 }
-            }
+            });
 
 
             // #pragma omp parallel for
@@ -2677,6 +2760,18 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
             ends[direction] = n;
             strides[direction] = 2;
             // size_t odd_len = n/2;//, even_len = n - odd_len;
+            if constexpr (CompMode == COMPMODE::DECOMP) {
+                if (reduced_omp_team) {
+                    const size_t rows = coarse_trip_count(begins[0], ends[0], strides[0]);
+                    parallel_for_logical_threads(rows, [&](size_t row, int tid) {
+                        const size_t i = begins[0] + row * strides[0];
+                        auto cur_ij_offset = offset + i * dim_offsets[0];
+                        interp_linear_and_quantize_1D_line<CompMode, false, SkipOverwrite>(
+                            data, n, dim_offsets[direction], cur_ij_offset, tid, quantize_func);
+                    });
+                    return predict_error;
+                }
+            }
             #pragma omp parallel for schedule(static)
             for (size_t i = begins[0]; i < ends[0]; i += strides[0]) {
                 auto tid = omp_get_thread_num();
@@ -2692,6 +2787,18 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
             ends[direction] = n;
             strides[direction] = 2;
             // size_t odd_len = n/2;//, even_len = n - odd_len;
+            if constexpr (CompMode == COMPMODE::DECOMP) {
+                if (reduced_omp_team) {
+                    const size_t rows = coarse_trip_count(begins[0], ends[0], strides[0]);
+                    parallel_for_logical_threads(rows, [&](size_t row, int tid) {
+                        const size_t i = begins[0] + row * strides[0];
+                        auto cur_ij_offset = offset + i * dim_offsets[0];
+                        interp_cubic_and_quantize_1D_line<CompMode, false, SkipOverwrite>(
+                            data, n, dim_offsets[direction], cur_ij_offset, tid, quantize_func);
+                    });
+                    return predict_error;
+                }
+            }
             #pragma omp parallel for schedule(static)
             for (size_t i = begins[0]; i < ends[0]; i += strides[0]) {
                 auto tid = omp_get_thread_num();
@@ -3787,6 +3894,8 @@ template <COMPMODE CompMode, bool SkipOverwrite, class QuantizeFunc>
     int16_t* total_quant_inds = nullptr;
     int16_t** local_quant_inds = nullptr;
     CacheLineInt* local_quant_index = nullptr;
+    std::unique_ptr<int16_t[], AlignedQuantDeleter> total_quant_inds_owner;
+    std::unique_ptr<int16_t*[]> local_quant_inds_owner;
     std::unique_ptr<CacheLineInt[]> local_quant_index_owner;
     size_t local_stream_capacity = 0;
 #ifdef __AVX2__

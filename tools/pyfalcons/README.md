@@ -116,18 +116,18 @@ additional metadata word; older plugins may discard it.
 
 The option controls compression execution, not the team used to decode an
 existing stream. A parallel interpolation stream records its compression team
-in its header, and decoding follows that stored team. Setting `num_threads=4`
+in its header, and decoding uses that team by default. Setting `num_threads=4`
 does not make a previously serial stream decode with four threads. If the
 stored team cannot be reproduced, decoding may fail.
 
-For example, 16 DataLoader workers are 16 processes. If each concurrently
-processes one stream using a four-thread team, there can be up to
-16 x 4 = 64 Falcons/OpenMP team threads (including the calling threads). For
-reads, those streams must already have been compressed with four-thread teams;
-the dataset option does not change their decoding teams. Actual concurrency
-may be lower because of automatic algorithm selection, sampling and tuning,
-or available CPU resources. This is not a limit on unrelated application
-threads or on additional streams processed simultaneously by a worker.
+For example, when chunks were compressed with four interpolation threads, a
+PyTorch `DataLoader(num_workers=16)` can use up to 16 x 4 = 64 Falcons/OpenMP
+team threads for simultaneous chunk reads by default, including the calling
+threads. No `worker_init_fn` is needed to use the recorded team size. Actual
+concurrency can be lower. This is not a limit on unrelated application threads
+or on additional streams processed simultaneously by a worker. With Linux
+`fork`, start workers before the parent runs OpenMP-parallel work. See the
+[DataLoader example](../H5Z-Falcons/README.md#reading-with-a-pytorch-dataloader).
 
 For other settings saved by the current C++ `Config::save`, use an existing
 configuration directly:

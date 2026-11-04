@@ -491,6 +491,7 @@ public:
     bool regression = true;
     bool regression2 = false;
     bool openmp = false;
+    int ompDecodeThreads = 0; // Runtime-only limit; zero uses the compression thread count.
     int quantbinCnt = 65536;
     int blockSize = 0;
     uint8_t predDim = 0;         // not used now

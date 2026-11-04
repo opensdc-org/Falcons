@@ -238,9 +238,11 @@ srun --export=ALL python train.py
 The plugin directory and its dependencies must be visible on every compute
 node. The export prepends it without discarding existing plugin paths. Set
 the plugin path before starting Python and make sure every task and data-loader
-worker inherits it. To request four Falcons threads per chunk without OpenMP
-environment variables, set `num_threads=4` when creating the dataset as shown
-below. The default filter configuration has OpenMP disabled.
+worker inherits it. Set `num_threads=4` when creating a dataset to request
+four compression threads per chunk. By default, a parallel interpolation chunk
+is decoded with its recorded compression team size. This setting does not need
+OpenMP environment variables. The default filter configuration has OpenMP
+disabled.
 
 Slurm does not expand shell environment variables in `#SBATCH` directives;
 the output directive uses Slurm's `%x` and `%j` substitutions instead. For a
@@ -271,9 +273,9 @@ with h5py.File("parallel.h5", "w") as f:
     f.create_dataset("field", data=data, chunks=(721, 1440), **options)
 ```
 
-`num_threads=4` sets the OpenMP team size inside the filter and temporarily
-disables dynamic teams for that call. The previous runtime settings are
-restored afterward. Neither `OMP_NUM_THREADS` nor `OMP_DYNAMIC` needs to be set.
+`num_threads=4` requests the OpenMP team size for compression and temporarily
+disables dynamic teams inside the filter call. The previous runtime settings
+are restored afterward. Neither `OMP_NUM_THREADS` nor `OMP_DYNAMIC` needs to be set.
 Build and load the plugin from the same updated Falcons source as the Python
 package: an older plugin can ignore the `num_threads` option.
 Omitting `num_threads` leaves the calling task's OpenMP settings unchanged;
@@ -299,18 +301,18 @@ options = config.h5py_options(num_threads=4)
 The compressor can still choose a lossless fallback for individual chunks;
 such chunks do not use the parallel interpolation decoder.
 
-The filter options are stored when the dataset is created. For parallel
-interpolation, each compressed chunk records its actual compression team size,
-and the current decoder requests that recorded size. Thus a serially compressed
-chunk will not become four-threaded during reading, and a chunk compressed with
-four threads must be decoded with a four-thread team. If runtime restrictions
-such as `OMP_THREAD_LIMIT` prevent that team from forming, decoding fails.
-An OpenMP-enabled plugin is required to decode a parallel chunk.
+The dataset's `num_threads` is a write-time setting. A parallel interpolation
+chunk records its actual compression team size; by default the decoder requests
+that size. A serially compressed chunk does not become parallel during reading.
+If runtime restrictions such as `OMP_THREAD_LIMIT` prevent the recorded team
+from forming, decoding fails. An OpenMP-enabled plugin is required to decode a
+parallel chunk.
 
 PyTorch `num_workers=16` starts 16 worker processes. If they simultaneously
-decode chunks recorded with four threads, their Falcons teams can use up to
-16 x 4 = 64 threads in total, plus the parent and other library threads. The
-example Slurm CPU request is a starting point, not a performance guarantee:
+decode chunks compressed with four interpolation threads, the default decoder
+can use up to 16 x 4 = 64 Falcons threads in total, plus the parent and other
+library threads. The example Slurm CPU request is a starting point, not a
+performance guarantee:
 Slurm may count logical CPUs, and SMT, affinity, worker placement and other
 libraries affect available physical cores. Measure on the allocated hardware.
 
@@ -457,9 +459,15 @@ require the Falcons plugin; they do not require the original error settings.
 ## Reading with a PyTorch DataLoader
 
 Set `HDF5_PLUGIN_PATH` before launching Python. Each worker must be able to
-load the plugin. Open the file inside the worker instead of keeping an HDF5
-file handle opened by the parent process. For example, this returns two
-consecutive times and only the selected channels:
+load the plugin. With Linux `fork`, start the workers before the parent runs
+OpenMP-parallel work, such as reading a parallel Falcons chunk or executing
+parallel PyTorch operations. Creating a `DataLoader` does not start its workers;
+`iter(loader)` does. Keep workers alive across epochs to avoid another fork
+after training has begun.
+
+Open the file lazily inside each worker rather than keeping a file handle opened
+by the parent. For example, for float32 data with effectively 2D chunks, this
+returns two consecutive times and only the selected channels:
 
 ```python
 import h5py
@@ -468,27 +476,30 @@ from torch.utils.data import DataLoader, Dataset
 
 
 class ERA5Dataset(Dataset):
-    def __init__(self, path, channels):
+    def __init__(self, path, channels, time_steps):
         self.path = path
         # h5py fancy indices must be unique and increasing; this is also the
         # order of channels in the returned tensors.
         self.channels = list(channels)
-        with h5py.File(path, "r") as f:
-            self.length = f["fields"].shape[0] - 1
+        self.length = time_steps - 1
+        self._file = None
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, index):
-        with h5py.File(self.path, "r") as f:
-            frames = f["fields"][index:index + 2, self.channels, :, :]
+        if self._file is None:
+            self._file = h5py.File(self.path, "r")
+        frames = self._file["fields"][index:index + 2, self.channels, :, :]
         return torch.from_numpy(frames[0]), torch.from_numpy(frames[1])
 
 
 if __name__ == "__main__":
-    dataset = ERA5Dataset("era5_falcons.h5", channels=range(19))
-    loader = DataLoader(dataset, batch_size=1, num_workers=16, pin_memory=True)
-    for inputs, targets in loader:
+    dataset = ERA5Dataset("era5_falcons.h5", channels=range(19), time_steps=1460)
+    loader = DataLoader(dataset, batch_size=1, num_workers=16,
+                        pin_memory=True, persistent_workers=True)
+    first_epoch = iter(loader)  # Fork workers before parent OpenMP work.
+    for inputs, targets in first_epoch:
         pass  # Use the tensors in your training loop.
 ```
 
@@ -496,11 +507,15 @@ Select the actual channel indices required by the model and preserve its
 expected order. With `(1, 1, H, W)` chunks, selecting channels inside the
 HDF5 read can avoid reading other channels. Whether compression improves
 throughput depends on the data, chunking, storage, cache and worker count;
-measure it against an uncompressed file with the same access pattern. A file
-written using four-thread interpolation can use up to four filter threads per
-worker; the worker count does not alter the saved thread count. GPU pinning
-requires an appropriate PyTorch accelerator build. See [OpenMP](#openmp) for
-the interaction between worker processes and per-chunk threads.
+measure it against an uncompressed file with the same access pattern. Each
+worker uses the recorded compression team size by default; no worker-specific
+decode setting is needed. The worker count does not alter that recorded size.
+Pass the dataset's actual time dimension as `time_steps` without reading the
+file in the parent. Closing a parent-opened file does not reset an OpenMP
+runtime that has already executed parallel work.
+GPU pinning requires an appropriate PyTorch accelerator build. See
+[OpenMP](#openmp) for the interaction between worker processes and per-chunk
+threads.
 
 ## HDF5 command-line tools and C/C++
 

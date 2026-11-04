@@ -17,6 +17,7 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #ifdef _OPENMP
@@ -64,6 +65,7 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
     }
 
     size_t compress(const Config &conf, T *data, uchar *cmpData, size_t cmpCap) override {
+        TemporaryStorageGuard cleanup{decomposition};
 #ifdef Falcons_PRINT_TIMINGS
         Timer timer(true);
 #endif
@@ -168,6 +170,13 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
             static_cast<size_t>(compression_thread_num) > cmpSize / sizeof(size_t))
             throw std::invalid_argument("Invalid OpenMP compression thread count");
         if (conf.dims.size() != N) throw std::invalid_argument("Invalid interpolation dimensions");
+        const int decode_threads = conf.ompDecodeThreads > 0
+            ? std::min(conf.ompDecodeThreads, compression_thread_num)
+            : compression_thread_num;
+        if constexpr (N != 2 || !std::is_same_v<T, float>) {
+            if (decode_threads < compression_thread_num)
+                throw std::runtime_error("Reduced OpenMP decoding is currently supported for 2D float data only");
+        }
         size_t data_count = 1;
         for (size_t dim : conf.dims) {
             if (dim == 0) throw std::invalid_argument("Invalid interpolation dimensions");
@@ -201,7 +210,7 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
             positions[tid] = buffer;
         };
         #ifdef _OPENMP
-        #pragma omp parallel for num_threads(compression_thread_num)
+        #pragma omp parallel for num_threads(decode_threads)
         #endif
         for (int tid = 0; tid < compression_thread_num; ++tid) {
             try { decompress_block(tid); }
@@ -239,7 +248,7 @@ class FalconsGenericCompressor_OMP : public concepts::CompressorInterface<T> {
             decode_block(0, encoder);
         } else {
             #ifdef _OPENMP
-            #pragma omp parallel for num_threads(compression_thread_num)
+            #pragma omp parallel for num_threads(decode_threads)
             #endif
             for (int tid = 0; tid < compression_thread_num; ++tid) {
                 try {

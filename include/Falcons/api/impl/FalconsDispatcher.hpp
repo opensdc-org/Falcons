@@ -106,7 +106,6 @@ calAbsErrorBound(conf, data);
             //     ::operator delete(dataCopy, std::align_val_t(alignment));
             if (std::string(e.what()) == Falcons_ERROR_COMP_BUFFER_NOT_LARGE_ENOUGH) {
                 isCmpCapSufficient = false;
-                printf("Falcons is downgraded to lossless mode because the buffer for compressed data is not large enough.\n");
             } else {
                 throw;
             }

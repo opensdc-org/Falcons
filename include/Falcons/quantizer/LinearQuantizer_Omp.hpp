@@ -31,6 +31,12 @@ namespace Falcons {
 
 template <class T>
 class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
+    struct AlignedUnpredDeleter {
+        void operator()(T *ptr) const noexcept {
+            ::operator delete[](ptr, std::align_val_t(64));
+        }
+    };
+
    public:
     LinearQuantizerOMP() : error_bound(1), double_error_bound(2), double_error_bound_reciprocal(0.5), radius(32768) {}
 
@@ -154,6 +160,7 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
         decoded_unpred_owner.reset();
         local_unpred_idx_owner.reset();
         local_unpred_owner.reset();
+        unpred_vec_owner.reset();
         unpred_vec = nullptr;
         local_unpred = nullptr;
         local_unpred_idx = nullptr;
@@ -171,17 +178,23 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
                                    elems_per_cacheline, elems_per_cacheline);
             const size_t total = buffer_bounds::mul(static_cast<size_t>(thread_count), padded_each_num);
             release_local_unpred();
+            std::unique_ptr<T[], AlignedUnpredDeleter> new_unpred_vec;
             if (each_num > 0) {
-                unpred_vec = new (std::align_val_t(64)) T[total];
-                local_unpred = new T*[thread_count];
-                local_unpred_idx = new CacheLineInt[thread_count];
-            } else {
-                local_unpred_owner.reset(new T*[thread_count]());
-                local_unpred_idx_owner.reset(new CacheLineInt[thread_count]);
-                decoded_unpred_owner.reset(new std::unique_ptr<T[]>[thread_count]);
-                local_unpred = local_unpred_owner.get();
-                local_unpred_idx = local_unpred_idx_owner.get();
+                new_unpred_vec.reset(new (std::align_val_t(64)) T[total]);
             }
+            std::unique_ptr<T*[]> new_local_unpred(
+                each_num > 0 ? new T*[thread_count] : new T*[thread_count]());
+            std::unique_ptr<CacheLineInt[]> new_local_unpred_idx(new CacheLineInt[thread_count]);
+            std::unique_ptr<std::unique_ptr<T[]>[]> new_decoded_unpred;
+            if (each_num == 0) new_decoded_unpred.reset(new std::unique_ptr<T[]>[thread_count]);
+
+            unpred_vec_owner = std::move(new_unpred_vec);
+            local_unpred_owner = std::move(new_local_unpred);
+            local_unpred_idx_owner = std::move(new_local_unpred_idx);
+            decoded_unpred_owner = std::move(new_decoded_unpred);
+            unpred_vec = unpred_vec_owner.get();
+            local_unpred = local_unpred_owner.get();
+            local_unpred_idx = local_unpred_idx_owner.get();
             local_thread_count = thread_count;
             #pragma omp parallel for
             for (int tid = 0; tid < thread_count; ++tid) {
@@ -363,6 +376,7 @@ class LinearQuantizerOMP : public concepts::QuantizerOMPInterface<T, int> {
     T* unpred_vec = nullptr;
     T** local_unpred = nullptr;
     CacheLineInt* local_unpred_idx = nullptr;
+    std::unique_ptr<T[], AlignedUnpredDeleter> unpred_vec_owner;
     std::unique_ptr<T*[]> local_unpred_owner;
     std::unique_ptr<CacheLineInt[]> local_unpred_idx_owner;
     std::unique_ptr<std::unique_ptr<T[]>[]> decoded_unpred_owner;
